@@ -18,6 +18,7 @@ import net.minecraft.sound.SoundCategory;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.math.Vec3d;
 
 import java.util.*;
 
@@ -40,6 +41,22 @@ public final class SocietyManager {
 
     private record Order(ServerWorld world, UUID subject, UUID giver, long deadline) {}
     private record Task(ServerWorld world, long time, Runnable action) {}
+    private record Say(ServerWorld world, UUID who, String msg) {}
+    private record Gathering(ServerWorld world, Vec3d center, List<UUID> members, long end) {}
+    private record Execution(ServerWorld world, UUID victim, UUID executioner, long deadline) {}
+
+    /** Пауза между репликами в чате (тики). 80 = 4 секунды. Увеличь, если всё ещё слишком быстро. */
+    private static final int CHAT_GAP_TICKS = 80;
+    /** Сколько реплик максимум ждёт очереди. */
+    private static final int CHAT_QUEUE_MAX = 30;
+    /** Минимум времени между казнями (тики). 6000 = 5 минут. */
+    private static final int EXECUTION_COOLDOWN_TICKS = 6000;
+
+    private static final Deque<Say> SAY_QUEUE = new ArrayDeque<>();
+    private static final Map<ServerWorld, Long> NEXT_SAY = new HashMap<>();
+    private static final List<Gathering> GATHERINGS = new ArrayList<>();
+    private static final List<Execution> EXECUTIONS = new ArrayList<>();
+    private static final Map<ServerWorld, Long> LAST_EXEC = new HashMap<>();
 
     private SocietyManager() {}
 
@@ -47,12 +64,15 @@ public final class SocietyManager {
     public static void tick(ServerWorld world) {
         long t = world.getTime();
         runTasks(world, t);
+        flushSpeech(world, t);
         if (t % 10 == 0) enforceNight(world);
         if (t % 20 == 5) processOrders(world);
+        if (t % 20 == 10) processGatherings(world);
+        if (t % 20 == 15) processExecutions(world);
         if (t % 100 == 7) updateRanks(world);
         if (t % 200 == 50) hunger(world);
-        if (t % 240 == 31) holdAssembly(world);
-        if (t % 300 == 200) smallTalk(world);
+        if (t % 600 == 31) holdAssembly(world);
+        if (t % 600 == 330) smallTalk(world);
         if (t % 360 == 123) giveOrders(world);
         if (t % 400 == 300) shove(world);
         if (t % 500 == 77) feed(world);
@@ -187,8 +207,29 @@ public final class SocietyManager {
     }
 
     // ============================================================ речь
+    /** Реплика не показывается сразу, а встаёт в очередь: в чате не больше одной реплики в CHAT_GAP_TICKS. */
     private static void say(ServerWorld w, VillagerEntity v, String msg) {
-        if (!v.isAlive()) return;
+        if (!v.isAlive() || SAY_QUEUE.size() >= CHAT_QUEUE_MAX) return;
+        SAY_QUEUE.add(new Say(w, v.getUuid(), msg));
+    }
+
+    private static void flushSpeech(ServerWorld w, long t) {
+        if (SAY_QUEUE.isEmpty() || t < NEXT_SAY.getOrDefault(w, 0L)) return;
+        Iterator<Say> it = SAY_QUEUE.iterator();
+        while (it.hasNext()) {
+            Say s = it.next();
+            if (s.world() != w) continue;
+            it.remove();
+            VillagerEntity v = byId(w, s.who());
+            if (v != null) {
+                deliver(w, v, s.msg());
+                NEXT_SAY.put(w, t + CHAT_GAP_TICKS);
+            }
+            return;
+        }
+    }
+
+    private static void deliver(ServerWorld w, VillagerEntity v, String msg) {
         Rank r = rank(v);
         Text line = Text.literal("<" + nameOf(v) + "> ").formatted(r == Rank.NONE ? Formatting.GRAY : r.color)
                 .append(Text.literal(msg).formatted(Formatting.WHITE));
@@ -277,7 +318,7 @@ public final class SocietyManager {
     private static List<VillagerEntity> pickGroup(List<VillagerEntity> all, VillagerEntity conv) {
         List<VillagerEntity> others = new ArrayList<>();
         for (VillagerEntity v : all) {
-            if (v != conv && v.squaredDistanceTo(conv) <= 144) others.add(v);
+            if (v != conv && v.squaredDistanceTo(conv) <= 576) others.add(v);
         }
         Collections.shuffle(others, RNG);
         List<VillagerEntity> group = new ArrayList<>();
@@ -291,12 +332,55 @@ public final class SocietyManager {
         return e instanceof VillagerEntity v && v.isAlive() ? v : null;
     }
 
+    /** Шаг 1: ведущий зовёт всех в одно место. Сами голоса — через ~18 секунд, когда все дойдут. */
     private static void holdAssembly(ServerWorld world) {
+        if (isNight(world)) return;
+        for (Gathering g : GATHERINGS) {
+            if (g.world() == world) return; // сбор уже идёт
+        }
         List<VillagerEntity> all = adults(world);
         if (all.size() < 2) return;
         VillagerEntity conv = all.get(RNG.nextInt(all.size()));
         List<VillagerEntity> group = pickGroup(all, conv);
         if (group.size() < 2) return;
+        List<UUID> ids = new ArrayList<>();
+        for (VillagerEntity v : group) ids.add(v.getUuid());
+        final UUID convId = conv.getUuid();
+        GATHERINGS.add(new Gathering(world, new Vec3d(conv.getX(), conv.getY(), conv.getZ()), ids, world.getTime() + 420));
+        if (playerNear(world, conv, 40)) say(world, conv, Speech.pick(Speech.ASSEMBLY_GATHER));
+        later(world, 360, () -> runVote(world, convId, ids));
+    }
+
+    private static void processGatherings(ServerWorld world) {
+        if (GATHERINGS.isEmpty()) return;
+        Iterator<Gathering> it = GATHERINGS.iterator();
+        while (it.hasNext()) {
+            Gathering g = it.next();
+            if (g.world() != world) continue;
+            if (world.getTime() > g.end()) {
+                it.remove();
+                continue;
+            }
+            for (UUID id : g.members()) {
+                VillagerEntity v = byId(world, id);
+                if (v == null || v.isSleeping()) continue;
+                if (v.squaredDistanceTo(g.center().x, g.center().y, g.center().z) > 9) {
+                    v.getBrain().remember(MemoryModuleType.WALK_TARGET, new WalkTarget(g.center(), 0.6f, 2));
+                }
+            }
+        }
+    }
+
+    /** Шаг 2: совещание и голосование. */
+    private static void runVote(ServerWorld world, UUID convId, List<UUID> ids) {
+        List<VillagerEntity> group = new ArrayList<>();
+        for (UUID id : ids) {
+            VillagerEntity v = byId(world, id);
+            if (v != null && !v.isBaby()) group.add(v);
+        }
+        if (group.size() < 2) return;
+        VillagerEntity conv = byId(world, convId);
+        if (conv == null || conv.isBaby()) conv = group.get(0);
 
         // --- бюллетени: каждый голосует «кто главнее» и «кто хуже»
         Map<UUID, Integer> upVotes = new HashMap<>();
@@ -341,7 +425,7 @@ public final class SocietyManager {
         UUID winner = argMax(upVotes, null);
         UUID loser = argMax(downVotes, winner);
 
-        // --- мнения меняются сразу: каждый жител сам решает, что думать
+        // --- мнения меняются сразу: каждый житель сам решает, что думать
         for (VillagerEntity voter : group) {
             UUID vid = voter.getUuid();
             SocietyData d = voter.getAttachedOrCreate(VillagerSocietyMod.SOCIETY);
@@ -354,49 +438,103 @@ public final class SocietyManager {
             voter.setAttached(VillagerSocietyMod.SOCIETY, d);
         }
 
-        if (!playerNear(world, conv, 40)) return;
-
-        // --- разговор с задержками, чтобы читалось как настоящее собрание
-        int delay = 0;
-        say(world, conv, Speech.pick(Speech.ASSEMBLY_START));
-        for (VillagerEntity voter : group) {
-            delay += 35;
-            UUID vid = voter.getUuid();
-            UUID up = upChoice.get(vid);
-            UUID dn = downChoice.get(vid);
-            final boolean sayDown = dn != null && RNG.nextInt(100) < 40;
-            later(world, delay, () -> {
-                VillagerEntity me = byId(world, vid);
-                if (me == null) return;
-                if (up != null && up.equals(vid)) {
-                    say(world, me, Speech.pick(Speech.VOTE_SELF));
-                } else if (up != null) {
-                    VillagerEntity c = byId(world, up);
-                    if (c != null) say(world, me, fmt(Speech.pick(Speech.VOTE_UP), nameOf(c)));
-                }
-                if (sayDown) {
-                    VillagerEntity c = byId(world, dn);
-                    if (c != null) say(world, me, fmt(Speech.pick(Speech.VOTE_DOWN), nameOf(c)));
-                }
+        boolean talk = playerNear(world, conv, 40);
+        if (talk) {
+            say(world, conv, Speech.pick(Speech.ASSEMBLY_START));
+            for (VillagerEntity voter : group) {
+                UUID vid = voter.getUuid();
+                UUID up = upChoice.get(vid);
+                UUID dn = downChoice.get(vid);
+                final boolean sayDown = dn != null && RNG.nextInt(100) < 40;
+                later(world, 20, () -> {
+                    VillagerEntity me = byId(world, vid);
+                    if (me == null) return;
+                    if (up != null && up.equals(vid)) {
+                        say(world, me, Speech.pick(Speech.VOTE_SELF));
+                    } else if (up != null) {
+                        VillagerEntity c = byId(world, up);
+                        if (c != null) say(world, me, fmt(Speech.pick(Speech.VOTE_UP), nameOf(c)));
+                    }
+                    if (sayDown) {
+                        VillagerEntity c = byId(world, dn);
+                        if (c != null) say(world, me, fmt(Speech.pick(Speech.VOTE_DOWN), nameOf(c)));
+                    }
+                });
+            }
+            final UUID cid = conv.getUuid();
+            final UUID win = winner;
+            final UUID lose = loser;
+            later(world, 20, () -> {
+                VillagerEntity c0 = byId(world, cid);
+                VillagerEntity w0 = byId(world, win);
+                VillagerEntity l0 = byId(world, lose);
+                if (c0 != null && w0 != null) say(world, c0, fmt(Speech.pick(Speech.RESULT_WIN), nameOf(w0)));
+                if (c0 != null && l0 != null) say(world, c0, fmt(Speech.pick(Speech.RESULT_LOSE), nameOf(l0)));
+                if (w0 != null) say(world, w0, Speech.pick(Speech.WIN_REACT));
+                if (l0 != null) say(world, l0, Speech.pick(Speech.LOSE_REACT));
             });
         }
-        delay += 50;
-        final UUID convId = conv.getUuid();
-        final UUID win = winner;
-        final UUID lose = loser;
-        later(world, delay, () -> {
-            VillagerEntity c0 = byId(world, convId);
-            VillagerEntity w0 = byId(world, win);
-            VillagerEntity l0 = byId(world, lose);
-            if (c0 != null && w0 != null) say(world, c0, fmt(Speech.pick(Speech.RESULT_WIN), nameOf(w0)));
-            if (c0 != null && l0 != null) say(world, c0, fmt(Speech.pick(Speech.RESULT_LOSE), nameOf(l0)));
-        });
-        later(world, delay + 40, () -> {
-            VillagerEntity w0 = byId(world, win);
-            VillagerEntity l0 = byId(world, lose);
-            if (w0 != null) say(world, w0, Speech.pick(Speech.WIN_REACT));
-            if (l0 != null) say(world, l0, Speech.pick(Speech.LOSE_REACT));
-        });
+
+        maybeExecute(world, group, loser, downVotes.getOrDefault(loser, 0), talk);
+    }
+
+    // ============================================================ казнь ненужного
+    /**
+     * Если у жителей уже есть иерархия, а самый нижний (изгой) набрал очень плохую репутацию и половина
+     * собрания против него — его решают убить. Работает только при 4+ взрослых на собрании,
+     * не чаще раза в 5 минут. Малышей это не касается никогда.
+     */
+    private static void maybeExecute(ServerWorld world, List<VillagerEntity> group, UUID loserId, int loserVotes, boolean talk) {
+        if (loserId == null || group.size() < 4) return;
+        long now = world.getTime();
+        if (now - LAST_EXEC.getOrDefault(world, -100000L) < EXECUTION_COOLDOWN_TICKS) return;
+        VillagerEntity victim = byId(world, loserId);
+        if (victim == null || victim.isBaby()) return;
+        if (RANKS.getOrDefault(loserId, Rank.NONE) != Rank.OUTCAST) return;
+        if (scoreOf(victim) > -4 || loserVotes * 2 < group.size()) return;
+
+        VillagerEntity exec = null;
+        for (VillagerEntity v : group) {
+            if (v == victim) continue;
+            if (exec == null || rank(v).power > rank(exec).power) exec = v;
+        }
+        if (exec == null) return;
+        LAST_EXEC.put(world, now);
+        EXECUTIONS.add(new Execution(world, loserId, exec.getUuid(), now + 900));
+        if (talk) {
+            say(world, exec, fmt(Speech.pick(Speech.EXEC_DECISION), nameOf(victim)));
+            say(world, exec, Speech.pick(Speech.EXEC_GO));
+        }
+    }
+
+    private static void processExecutions(ServerWorld world) {
+        if (EXECUTIONS.isEmpty()) return;
+        Iterator<Execution> it = EXECUTIONS.iterator();
+        while (it.hasNext()) {
+            Execution e = it.next();
+            if (e.world() != world) continue;
+            VillagerEntity victim = byId(world, e.victim());
+            VillagerEntity exec = byId(world, e.executioner());
+            if (victim == null || exec == null || victim.isBaby() || world.getTime() > e.deadline()) {
+                it.remove();
+                continue;
+            }
+            exec.getBrain().remember(MemoryModuleType.WALK_TARGET, new WalkTarget(victim, 0.8f, 1));
+            if (exec.squaredDistanceTo(victim) < 4.0) {
+                it.remove();
+                boolean talk = playerNear(world, exec, 40);
+                kill(world, victim);
+                if (talk) say(world, exec, Speech.pick(Speech.EXEC_DONE));
+            }
+        }
+    }
+
+    /** Если после обновления Minecraft эта строка перестанет компилироваться — поправь только её. */
+    private static void kill(ServerWorld world, VillagerEntity v) {
+        UUID id = v.getUuid();
+        v.kill(world);
+        RANKS.remove(id);
+        SCORES.remove(id);
     }
 
     // ============================================================ болтовня
